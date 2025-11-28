@@ -1,7 +1,7 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
-import { CheckCircle2, XCircle, HelpCircle, Filter, BarChart3, Download } from 'lucide-react'
+import { CheckCircle2, XCircle, HelpCircle, Filter, BarChart3, Download, ChevronLeft, ChevronRight } from 'lucide-react'
 import {
   BarChart,
   Bar,
@@ -16,6 +16,7 @@ import {
   Legend,
 } from 'recharts'
 import { supabase } from '@/lib/supabase'
+import { validateEvaluations } from '@/lib/validation'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import {
@@ -42,34 +43,20 @@ import {
 import { Checkbox } from '@/components/ui/checkbox'
 import { Label } from '@/components/ui/label'
 
-interface Evaluation {
-  id: string
-  verdict: 'pass' | 'fail' | 'inconclusive'
-  reasoning: string
-  created_at: string
-  question_id: string
-  judge_id: string
-  questions: {
-    id: string
-    question_text: string
-    submission_id: string
-  } | null
-  judges: {
-    id: string
-    name: string
-  } | null
-}
-
 const CHART_COLORS = {
   pass: '#22c55e',
   fail: '#ef4444',
   inconclusive: '#eab308',
 }
 
+const PAGE_SIZE_OPTIONS = [10, 25, 50, 100]
+
 export function ResultsPage() {
   const [selectedJudges, setSelectedJudges] = useState<string[]>([])
   const [selectedQuestions, setSelectedQuestions] = useState<string[]>([])
   const [verdictFilter, setVerdictFilter] = useState<string>('all')
+  const [currentPage, setCurrentPage] = useState(1)
+  const [pageSize, setPageSize] = useState(25)
 
   // Fetch all evaluations with related data
   const { data: evaluations, isLoading } = useQuery({
@@ -90,7 +77,8 @@ export function ResultsPage() {
         .order('created_at', { ascending: false })
 
       if (error) throw error
-      return data as unknown as Evaluation[]
+      // Validate response data at runtime
+      return validateEvaluations(data)
     },
   })
 
@@ -140,6 +128,24 @@ export function ResultsPage() {
       return true
     })
   }, [evaluations, selectedJudges, selectedQuestions, verdictFilter])
+
+  // Reset to page 1 when filters change
+  useEffect(() => {
+    setCurrentPage(1)
+  }, [selectedJudges, selectedQuestions, verdictFilter])
+
+  // Pagination computed values
+  const totalPages = Math.ceil(filteredEvaluations.length / pageSize)
+  const startIndex = (currentPage - 1) * pageSize
+  const endIndex = startIndex + pageSize
+  const paginatedEvaluations = filteredEvaluations.slice(startIndex, endIndex)
+
+  // Ensure current page is valid when data changes
+  useEffect(() => {
+    if (currentPage > totalPages && totalPages > 0) {
+      setCurrentPage(totalPages)
+    }
+  }, [totalPages, currentPage])
 
   // Calculate stats
   const stats = useMemo(() => {
@@ -212,6 +218,12 @@ export function ResultsPage() {
     setSelectedJudges([])
     setSelectedQuestions([])
     setVerdictFilter('all')
+    setCurrentPage(1)
+  }
+
+  const handlePageSizeChange = (newSize: string) => {
+    setPageSize(Number(newSize))
+    setCurrentPage(1)
   }
 
   const hasFilters = selectedJudges.length > 0 || selectedQuestions.length > 0 || verdictFilter !== 'all'
@@ -238,28 +250,38 @@ export function ResultsPage() {
     }
   }
 
+  // Escape a field for CSV (RFC 4180 compliant)
+  const escapeCSVField = (value: string): string => {
+    // If field contains quotes, commas, or newlines, wrap in quotes and escape internal quotes
+    if (value.includes('"') || value.includes(',') || value.includes('\n') || value.includes('\r')) {
+      return `"${value.replace(/"/g, '""')}"`
+    }
+    return value
+  }
+
   // Convert evaluations to CSV format
   const exportToCSV = () => {
     if (filteredEvaluations.length === 0) return
 
-    const headers = ['Question', 'Judge', 'Verdict', 'Reasoning', 'Created At']
+    const headers = ['Submission', 'Question', 'Judge', 'Verdict', 'Reasoning', 'Created At']
 
     const rows = filteredEvaluations.map((e) => [
-      // Escape quotes and wrap in quotes to handle commas/newlines in text
-      `"${(e.questions?.question_text || 'Unknown').replace(/"/g, '""')}"`,
-      `"${(e.judges?.name || 'Unknown').replace(/"/g, '""')}"`,
-      e.verdict,
-      `"${(e.reasoning || '').replace(/"/g, '""')}"`,
-      format(new Date(e.created_at), 'yyyy-MM-dd HH:mm:ss'),
+      escapeCSVField(e.questions?.submission_id || 'Unknown'),
+      escapeCSVField(e.questions?.question_text || 'Unknown'),
+      escapeCSVField(e.judges?.name || 'Unknown'),
+      escapeCSVField(e.verdict),
+      escapeCSVField(e.reasoning || ''),
+      escapeCSVField(format(new Date(e.created_at), 'yyyy-MM-dd HH:mm:ss')),
     ])
 
     const csvContent = [
       headers.join(','),
       ...rows.map((row) => row.join(',')),
-    ].join('\n')
+    ].join('\r\n') // Use CRLF for better compatibility
 
-    // Create blob and trigger download
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' })
+    // Create blob with UTF-8 BOM for Excel compatibility
+    const BOM = '\uFEFF'
+    const blob = new Blob([BOM + csvContent], { type: 'text/csv;charset=utf-8;' })
     const url = URL.createObjectURL(blob)
     const link = document.createElement('a')
     link.setAttribute('href', url)
@@ -517,47 +539,100 @@ export function ResultsPage() {
               )}
             </div>
           ) : (
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Question</TableHead>
-                  <TableHead className="w-[140px]">Judge</TableHead>
-                  <TableHead className="w-[120px]">Verdict</TableHead>
-                  <TableHead>Reasoning</TableHead>
-                  <TableHead className="w-[140px]">Created</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {filteredEvaluations.map((evaluation) => (
-                  <TableRow key={evaluation.id}>
-                    <TableCell>
-                      <p className="text-sm line-clamp-2">
-                        {evaluation.questions?.question_text || 'Unknown'}
-                      </p>
-                    </TableCell>
-                    <TableCell>
-                      <p className="text-sm">{evaluation.judges?.name || 'Unknown'}</p>
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex items-center gap-2">
-                        {getVerdictIcon(evaluation.verdict)}
-                        {getVerdictBadge(evaluation.verdict)}
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      <p className="text-sm text-muted-foreground line-clamp-2">
-                        {evaluation.reasoning}
-                      </p>
-                    </TableCell>
-                    <TableCell>
-                      <p className="text-sm text-muted-foreground">
-                        {format(new Date(evaluation.created_at), 'MMM d, h:mm a')}
-                      </p>
-                    </TableCell>
+            <>
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="w-[120px]">Submission</TableHead>
+                    <TableHead>Question</TableHead>
+                    <TableHead className="w-[140px]">Judge</TableHead>
+                    <TableHead className="w-[120px]">Verdict</TableHead>
+                    <TableHead>Reasoning</TableHead>
+                    <TableHead className="w-[140px]">Created</TableHead>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
+                </TableHeader>
+                <TableBody>
+                  {paginatedEvaluations.map((evaluation) => (
+                    <TableRow key={evaluation.id}>
+                      <TableCell>
+                        <p className="text-sm font-mono text-muted-foreground truncate max-w-[120px]" title={evaluation.questions?.submission_id || 'Unknown'}>
+                          {evaluation.questions?.submission_id || 'Unknown'}
+                        </p>
+                      </TableCell>
+                      <TableCell>
+                        <p className="text-sm line-clamp-2">
+                          {evaluation.questions?.question_text || 'Unknown'}
+                        </p>
+                      </TableCell>
+                      <TableCell>
+                        <p className="text-sm">{evaluation.judges?.name || 'Unknown'}</p>
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex items-center gap-2">
+                          {getVerdictIcon(evaluation.verdict)}
+                          {getVerdictBadge(evaluation.verdict)}
+                        </div>
+                      </TableCell>
+                      <TableCell>
+                        <p className="text-sm text-muted-foreground line-clamp-2">
+                          {evaluation.reasoning}
+                        </p>
+                      </TableCell>
+                      <TableCell>
+                        <p className="text-sm text-muted-foreground">
+                          {format(new Date(evaluation.created_at), 'MMM d, h:mm a')}
+                        </p>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+
+              {/* Pagination Controls */}
+              <div className="flex items-center justify-between px-4 py-3 border-t">
+                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                  <span>Rows per page:</span>
+                  <Select value={String(pageSize)} onValueChange={handlePageSizeChange}>
+                    <SelectTrigger className="w-[70px] h-8">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {PAGE_SIZE_OPTIONS.map((size) => (
+                        <SelectItem key={size} value={String(size)}>
+                          {size}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                <div className="flex items-center gap-4">
+                  <span className="text-sm text-muted-foreground">
+                    {startIndex + 1}-{Math.min(endIndex, filteredEvaluations.length)} of {filteredEvaluations.length}
+                  </span>
+                  <div className="flex items-center gap-1">
+                    <Button
+                      variant="outline"
+                      size="icon"
+                      className="h-8 w-8"
+                      onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                      disabled={currentPage === 1}
+                    >
+                      <ChevronLeft className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="icon"
+                      className="h-8 w-8"
+                      onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                      disabled={currentPage === totalPages}
+                    >
+                      <ChevronRight className="h-4 w-4" />
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            </>
           )}
         </CardContent>
       </Card>

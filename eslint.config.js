@@ -19,5 +19,13 @@ export default defineConfig([
       ecmaVersion: 2020,
       globals: globals.browser,
     },
+    rules: {
+      // Allow unused vars starting with underscore (for intentional omissions)
+      '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }],
+      // Allow non-component exports in files (for types, constants, etc.)
+      'react-refresh/only-export-components': 'off',
+      // Allow setState in useEffect for valid patterns like pagination reset
+      'react-hooks/set-state-in-effect': 'off',
+    },
   },
 ])

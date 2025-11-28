@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
+import { AlertCircle } from 'lucide-react'
 import { FileUpload } from '@/components/submissions/FileUpload'
 import { ingestSubmissions } from '@/services/ingestion'
 import type { IngestionResult } from '@/services/ingestion'
@@ -29,6 +30,7 @@ interface SubmissionRow {
 export function SubmissionsPage() {
   const [isUploading, setIsUploading] = useState(false)
   const [uploadError, setUploadError] = useState<string | null>(null)
+  const [validationErrors, setValidationErrors] = useState<string[]>([])
   const [uploadSuccess, setUploadSuccess] = useState(false)
 
   // Fetch submissions with their questions count
@@ -52,6 +54,7 @@ export function SubmissionsPage() {
   const handleFileSelect = async (file: File) => {
     setIsUploading(true)
     setUploadError(null)
+    setValidationErrors([])
     setUploadSuccess(false)
 
     const result: IngestionResult = await ingestSubmissions(file)
@@ -68,6 +71,7 @@ export function SubmissionsPage() {
       setTimeout(() => setUploadSuccess(false), 3000)
     } else {
       setUploadError(result.error || 'Unknown error')
+      setValidationErrors(result.validationErrors || [])
       toast.error('Import failed', {
         description: result.error,
       })
@@ -96,13 +100,34 @@ export function SubmissionsPage() {
             Upload a JSON file containing submissions to evaluate
           </CardDescription>
         </CardHeader>
-        <CardContent>
+        <CardContent className="space-y-4">
           <FileUpload
             onFileSelect={handleFileSelect}
             isLoading={isUploading}
             error={uploadError}
             success={uploadSuccess}
           />
+
+          {/* Validation Errors Detail */}
+          {validationErrors.length > 0 && (
+            <div className="rounded-lg border border-red-200 bg-red-50 dark:border-red-900 dark:bg-red-950/50 p-4">
+              <div className="flex items-start gap-3">
+                <AlertCircle className="h-5 w-5 text-red-500 mt-0.5 flex-shrink-0" />
+                <div className="space-y-2 flex-1 min-w-0">
+                  <p className="text-sm font-medium text-red-800 dark:text-red-200">
+                    Validation Errors
+                  </p>
+                  <ul className="text-sm text-red-700 dark:text-red-300 space-y-1 list-disc list-inside">
+                    {validationErrors.map((error, index) => (
+                      <li key={index} className="break-words">
+                        {error}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+            </div>
+          )}
         </CardContent>
       </Card>
 

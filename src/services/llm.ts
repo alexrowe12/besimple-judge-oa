@@ -34,6 +34,51 @@ export interface EvaluationResponse {
 const OPENAI_API_KEY = import.meta.env.VITE_OPENAI_API_KEY
 const ANTHROPIC_API_KEY = import.meta.env.VITE_ANTHROPIC_API_KEY
 
+// Request timeout in milliseconds (30 seconds)
+const REQUEST_TIMEOUT = 30000
+
+// Rate limiting configuration
+const MAX_RETRIES = 3
+const INITIAL_RETRY_DELAY = 1000 // 1 second
+
+// Helper to create a fetch with timeout
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit,
+  timeout: number = REQUEST_TIMEOUT
+): Promise<Response> {
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), timeout)
+
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    })
+    return response
+  } finally {
+    clearTimeout(timeoutId)
+  }
+}
+
+// Helper to check if error is retryable (rate limit or server error)
+function isRetryableError(status: number): boolean {
+  return status === 429 || status >= 500
+}
+
+// Helper to get retry delay with exponential backoff
+function getRetryDelay(attempt: number, retryAfterHeader?: string | null): number {
+  // Use Retry-After header if provided
+  if (retryAfterHeader) {
+    const retryAfter = parseInt(retryAfterHeader, 10)
+    if (!isNaN(retryAfter)) {
+      return retryAfter * 1000
+    }
+  }
+  // Exponential backoff: 1s, 2s, 4s, etc.
+  return INITIAL_RETRY_DELAY * Math.pow(2, attempt)
+}
+
 // Default prompt fields if not specified
 const DEFAULT_PROMPT_FIELDS: PromptFields = {
   includeQuestionText: true,
@@ -69,16 +114,25 @@ function buildPromptText(request: EvaluationRequest): string {
   if (fields.includeAnswerReasoning && request.answer.reasoning) {
     answerParts.push(`Reasoning: ${request.answer.reasoning}`)
   }
-  if (fields.includeRawAnswer) {
-    // Include any extra fields from raw_value
-    const { choice, reasoning, ...extraFields } = request.answer
-    if (Object.keys(extraFields).length > 0) {
-      answerParts.push(`Additional Data:\n${JSON.stringify(extraFields, null, 2)}`)
-    }
+
+  // Get extra fields (excluding choice and reasoning which are handled above)
+  const { choice: _choice, reasoning: _reasoning, ...extraFields } = request.answer
+  const hasExtraFields = Object.keys(extraFields).length > 0
+
+  if (fields.includeRawAnswer && hasExtraFields) {
+    // Include extra fields when explicitly enabled
+    answerParts.push(`Additional Data:\n${JSON.stringify(extraFields, null, 2)}`)
+  } else if (answerParts.length === 0 && hasExtraFields) {
+    // Fallback: if no standard fields were included but there IS answer data,
+    // include the raw answer so the LLM has something to evaluate
+    answerParts.push(`Answer:\n${JSON.stringify(extraFields, null, 2)}`)
   }
 
   if (answerParts.length > 0) {
     parts.push(`\nUser's Answer:\n${answerParts.join('\n')}`)
+  } else if (Object.keys(request.answer).length === 0) {
+    // Explicitly note when there's no answer at all
+    parts.push(`\nUser's Answer: [No answer provided]`)
   }
 
   // Evaluation instruction
@@ -89,22 +143,101 @@ Respond with ONLY a valid JSON object in this exact format:
   return parts.join('\n')
 }
 
-function parseResponse(text: string): EvaluationResponse {
-  // Try to extract JSON from the response
-  const jsonMatch = text.match(/\{[\s\S]*?\}/)
-  if (!jsonMatch) {
-    throw new Error('No JSON found in response')
+const VALID_VERDICTS = ['pass', 'fail', 'inconclusive'] as const
+
+function extractJSON(text: string): string | null {
+  // Try to find JSON object, handling nested braces
+  // Look for opening brace and find matching closing brace
+  const startIndex = text.indexOf('{')
+  if (startIndex === -1) return null
+
+  let braceCount = 0
+  let inString = false
+  let escapeNext = false
+
+  for (let i = startIndex; i < text.length; i++) {
+    const char = text[i]
+
+    if (escapeNext) {
+      escapeNext = false
+      continue
+    }
+
+    if (char === '\\' && inString) {
+      escapeNext = true
+      continue
+    }
+
+    if (char === '"') {
+      inString = !inString
+      continue
+    }
+
+    if (!inString) {
+      if (char === '{') braceCount++
+      else if (char === '}') {
+        braceCount--
+        if (braceCount === 0) {
+          return text.slice(startIndex, i + 1)
+        }
+      }
+    }
   }
 
-  const parsed = JSON.parse(jsonMatch[0])
+  return null
+}
 
-  if (!['pass', 'fail', 'inconclusive'].includes(parsed.verdict)) {
-    throw new Error(`Invalid verdict: ${parsed.verdict}`)
+function parseResponse(text: string): EvaluationResponse {
+  // Extract JSON from the response
+  const jsonString = extractJSON(text)
+  if (!jsonString) {
+    throw new Error(`No JSON object found in response. Raw response: "${text.slice(0, 200)}..."`)
+  }
+
+  // Parse JSON with error handling
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(jsonString)
+  } catch (e) {
+    throw new Error(`Invalid JSON in response: ${e instanceof Error ? e.message : 'Parse error'}. Extracted: "${jsonString.slice(0, 100)}..."`)
+  }
+
+  // Validate parsed is an object
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error(`Expected JSON object, got ${Array.isArray(parsed) ? 'array' : typeof parsed}`)
+  }
+
+  const obj = parsed as Record<string, unknown>
+
+  // Validate verdict field exists and is valid
+  if (!('verdict' in obj)) {
+    throw new Error('Response missing required "verdict" field')
+  }
+
+  const verdict = obj.verdict
+  if (typeof verdict !== 'string') {
+    throw new Error(`"verdict" must be a string, got ${typeof verdict}`)
+  }
+
+  const normalizedVerdict = verdict.toLowerCase().trim()
+  if (!VALID_VERDICTS.includes(normalizedVerdict as typeof VALID_VERDICTS[number])) {
+    throw new Error(`Invalid verdict "${verdict}". Must be one of: ${VALID_VERDICTS.join(', ')}`)
+  }
+
+  // Validate reasoning field (optional but should be string if present)
+  let reasoning = 'No reasoning provided'
+  if ('reasoning' in obj && obj.reasoning != null) {
+    if (typeof obj.reasoning === 'string') {
+      reasoning = obj.reasoning.trim() || 'No reasoning provided'
+    } else {
+      // Convert non-string reasoning to string representation
+      reasoning = String(obj.reasoning)
+    }
   }
 
   return {
-    verdict: parsed.verdict,
-    reasoning: parsed.reasoning || 'No reasoning provided',
+    verdict: normalizedVerdict as 'pass' | 'fail' | 'inconclusive',
+    reasoning,
   }
 }
 
@@ -249,55 +382,91 @@ export async function callOpenAI(
     max_completion_tokens: 2048,
   }
 
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify(body),
-  })
+  let lastError: Error | null = null
 
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({}))
-    throw new Error(
-      error.error?.message || `OpenAI API error: ${response.status}`
-    )
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const response = await fetchWithTimeout(
+        'https://api.openai.com/v1/chat/completions',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${OPENAI_API_KEY}`,
+          },
+          body: JSON.stringify(body),
+        }
+      )
+
+      if (!response.ok) {
+        // Check if we should retry
+        if (isRetryableError(response.status) && attempt < MAX_RETRIES) {
+          const delay = getRetryDelay(attempt, response.headers.get('Retry-After'))
+          console.warn(`OpenAI rate limited (${response.status}), retrying in ${delay}ms...`)
+          await new Promise((resolve) => setTimeout(resolve, delay))
+          continue
+        }
+
+        const error = await response.json().catch(() => ({}))
+        throw new Error(
+          error.error?.message || `OpenAI API error: ${response.status}`
+        )
+      }
+
+      const data = await response.json()
+
+      // Check for various response issues
+      if (data.error) {
+        throw new Error(data.error.message || 'OpenAI API returned an error')
+      }
+
+      const choice = data.choices?.[0]
+
+      // Check for refusal
+      if (choice?.message?.refusal) {
+        throw new Error(`Model refused: ${choice.message.refusal}`)
+      }
+
+      // Check finish reason
+      if (choice?.finish_reason === 'content_filter') {
+        throw new Error('Response blocked by content filter')
+      }
+
+      const content = choice?.message?.content
+
+      if (!content) {
+        // Provide more detail about what we received
+        const debugInfo = JSON.stringify({
+          hasChoices: !!data.choices,
+          choicesLength: data.choices?.length,
+          finishReason: choice?.finish_reason,
+          hasMessage: !!choice?.message,
+        })
+        throw new Error(`No content in OpenAI response. Debug: ${debugInfo}`)
+      }
+
+      return parseResponse(content)
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error))
+
+      // Handle timeout specifically
+      if (lastError.name === 'AbortError') {
+        lastError = new Error('Request timed out after 30 seconds')
+      }
+
+      // Only retry on network errors if we have retries left
+      if (attempt < MAX_RETRIES && lastError.message.includes('fetch')) {
+        const delay = getRetryDelay(attempt)
+        console.warn(`OpenAI network error, retrying in ${delay}ms...`)
+        await new Promise((resolve) => setTimeout(resolve, delay))
+        continue
+      }
+
+      throw lastError
+    }
   }
 
-  const data = await response.json()
-
-  // Check for various response issues
-  if (data.error) {
-    throw new Error(data.error.message || 'OpenAI API returned an error')
-  }
-
-  const choice = data.choices?.[0]
-
-  // Check for refusal
-  if (choice?.message?.refusal) {
-    throw new Error(`Model refused: ${choice.message.refusal}`)
-  }
-
-  // Check finish reason
-  if (choice?.finish_reason === 'content_filter') {
-    throw new Error('Response blocked by content filter')
-  }
-
-  const content = choice?.message?.content
-
-  if (!content) {
-    // Provide more detail about what we received
-    const debugInfo = JSON.stringify({
-      hasChoices: !!data.choices,
-      choicesLength: data.choices?.length,
-      finishReason: choice?.finish_reason,
-      hasMessage: !!choice?.message,
-    })
-    throw new Error(`No content in OpenAI response. Debug: ${debugInfo}`)
-  }
-
-  return parseResponse(content)
+  throw lastError || new Error('OpenAI request failed after retries')
 }
 
 export async function callAnthropic(
@@ -310,37 +479,73 @@ export async function callAnthropic(
 
   const userContent = await buildAnthropicContent(request)
 
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-      'anthropic-dangerous-direct-browser-access': 'true',
-    },
-    body: JSON.stringify({
-      model,
-      max_tokens: 1024,
-      system: request.systemPrompt,
-      messages: [{ role: 'user', content: userContent }],
-    }),
-  })
+  let lastError: Error | null = null
 
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({}))
-    throw new Error(
-      error.error?.message || `Anthropic API error: ${response.status}`
-    )
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const response = await fetchWithTimeout(
+        'https://api.anthropic.com/v1/messages',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': ANTHROPIC_API_KEY,
+            'anthropic-version': '2023-06-01',
+            'anthropic-dangerous-direct-browser-access': 'true',
+          },
+          body: JSON.stringify({
+            model,
+            max_tokens: 1024,
+            system: request.systemPrompt,
+            messages: [{ role: 'user', content: userContent }],
+          }),
+        }
+      )
+
+      if (!response.ok) {
+        // Check if we should retry
+        if (isRetryableError(response.status) && attempt < MAX_RETRIES) {
+          const delay = getRetryDelay(attempt, response.headers.get('Retry-After'))
+          console.warn(`Anthropic rate limited (${response.status}), retrying in ${delay}ms...`)
+          await new Promise((resolve) => setTimeout(resolve, delay))
+          continue
+        }
+
+        const error = await response.json().catch(() => ({}))
+        throw new Error(
+          error.error?.message || `Anthropic API error: ${response.status}`
+        )
+      }
+
+      const data = await response.json()
+      const content = data.content?.[0]?.text
+
+      if (!content) {
+        throw new Error('No content in Anthropic response')
+      }
+
+      return parseResponse(content)
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error))
+
+      // Handle timeout specifically
+      if (lastError.name === 'AbortError') {
+        lastError = new Error('Request timed out after 30 seconds')
+      }
+
+      // Only retry on network errors if we have retries left
+      if (attempt < MAX_RETRIES && lastError.message.includes('fetch')) {
+        const delay = getRetryDelay(attempt)
+        console.warn(`Anthropic network error, retrying in ${delay}ms...`)
+        await new Promise((resolve) => setTimeout(resolve, delay))
+        continue
+      }
+
+      throw lastError
+    }
   }
 
-  const data = await response.json()
-  const content = data.content?.[0]?.text
-
-  if (!content) {
-    throw new Error('No content in Anthropic response')
-  }
-
-  return parseResponse(content)
+  throw lastError || new Error('Anthropic request failed after retries')
 }
 
 export async function evaluate(

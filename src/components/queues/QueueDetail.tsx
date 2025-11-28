@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft, Play, Paperclip } from 'lucide-react'
@@ -45,6 +46,8 @@ interface QueueDetailProps {
 
 export function QueueDetail({ queueId }: QueueDetailProps) {
   const queryClient = useQueryClient()
+  // Track which (judgeId:templateId) pairs are currently being mutated
+  const [pendingMutations, setPendingMutations] = useState<Set<string>>(new Set())
 
   // Fetch queue info
   const { data: queue } = useQuery({
@@ -132,6 +135,9 @@ export function QueueDetail({ queueId }: QueueDetailProps) {
     },
   })
 
+  // Helper to create mutation key
+  const getMutationKey = (judgeId: string, templateId: string) => `${judgeId}:${templateId}`
+
   // Toggle assignment mutation
   const toggleAssignment = useMutation({
     mutationFn: async ({
@@ -164,6 +170,20 @@ export function QueueDetail({ queueId }: QueueDetailProps) {
         if (error) throw error
       }
     },
+    onMutate: ({ judgeId, templateId }) => {
+      // Add to pending set before mutation starts
+      const key = getMutationKey(judgeId, templateId)
+      setPendingMutations((prev) => new Set(prev).add(key))
+    },
+    onSettled: (_data, _error, { judgeId, templateId }) => {
+      // Remove from pending set when mutation completes (success or error)
+      const key = getMutationKey(judgeId, templateId)
+      setPendingMutations((prev) => {
+        const next = new Set(prev)
+        next.delete(key)
+        return next
+      })
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['assignments', queueId] })
     },
@@ -173,6 +193,11 @@ export function QueueDetail({ queueId }: QueueDetailProps) {
       })
     },
   })
+
+  // Check if a mutation is pending for a specific judge/template pair
+  const isMutationPending = (judgeId: string, templateId: string) => {
+    return pendingMutations.has(getMutationKey(judgeId, templateId))
+  }
 
   // Check if a judge is assigned to a template
   const isAssigned = (judgeId: string, templateId: string) => {
@@ -266,17 +291,21 @@ export function QueueDetail({ queueId }: QueueDetailProps) {
                     <div className="flex flex-wrap gap-3">
                       {judges.map((judge) => {
                         const assigned = isAssigned(judge.id, template.template_id)
+                        const isPending = isMutationPending(judge.id, template.template_id)
                         return (
                           <label
                             key={judge.id}
-                            className={`flex items-center gap-2 px-3 py-2 rounded-md border cursor-pointer transition-colors ${
-                              assigned
-                                ? 'bg-primary/10 border-primary'
-                                : 'hover:bg-muted'
+                            className={`flex items-center gap-2 px-3 py-2 rounded-md border transition-colors ${
+                              isPending
+                                ? 'opacity-50 cursor-wait'
+                                : assigned
+                                  ? 'bg-primary/10 border-primary cursor-pointer'
+                                  : 'hover:bg-muted cursor-pointer'
                             }`}
                           >
                             <Checkbox
                               checked={assigned}
+                              disabled={isPending}
                               onCheckedChange={() =>
                                 toggleAssignment.mutate({
                                   judgeId: judge.id,

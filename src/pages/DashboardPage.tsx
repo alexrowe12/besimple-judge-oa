@@ -31,20 +31,26 @@ export function DashboardPage() {
     },
   })
 
-  // Fetch evaluations stats (total count and pass count)
+  // Fetch evaluations stats using efficient count queries
   const { data: evaluationStats, isLoading: loadingEvaluations } = useQuery({
     queryKey: ['dashboard', 'evaluation-stats'],
     queryFn: async () => {
-      const { data, error } = await supabase
+      // Get total count
+      const { count: total, error: totalError } = await supabase
         .from('evaluations')
-        .select('verdict')
+        .select('*', { count: 'exact', head: true })
 
-      if (error) throw error
+      if (totalError) throw totalError
 
-      const total = data?.length || 0
-      const passed = data?.filter((e) => e.verdict === 'pass').length || 0
+      // Get passed count
+      const { count: passed, error: passedError } = await supabase
+        .from('evaluations')
+        .select('*', { count: 'exact', head: true })
+        .eq('verdict', 'pass')
 
-      return { total, passed }
+      if (passedError) throw passedError
+
+      return { total: total || 0, passed: passed || 0 }
     },
   })
 

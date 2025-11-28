@@ -1,7 +1,8 @@
 import { supabase } from '@/lib/supabase'
 import { evaluate } from './llm'
-import type { EvaluationResponse, Attachment, PromptFields } from './llm'
+import type { EvaluationResponse, Attachment } from './llm'
 import { getAttachmentsForQuestion } from './storage'
+import { validateJudge, type ValidatedJudge } from '@/lib/validation'
 
 export interface EvaluationTask {
   questionId: string
@@ -13,14 +14,7 @@ export interface EvaluationTask {
     reasoning?: string
     [key: string]: unknown
   }
-  judge: {
-    id: string
-    name: string
-    system_prompt: string
-    model_provider: 'openai' | 'anthropic'
-    model_name: string
-    prompt_fields?: PromptFields
-  }
+  judge: ValidatedJudge
 }
 
 export interface RunProgress {
@@ -106,19 +100,15 @@ export async function getEvaluationTasksWithSkipped(queueId: string): Promise<Ta
     const answer = question.answers?.[0] || {}
 
     for (const judge of assignedJudges) {
-      if (!judge || typeof judge !== 'object') continue
-
-      const judgeData = judge as unknown as {
-        id: string
-        name: string
-        system_prompt: string
-        model_provider: string
-        model_name: string
-        prompt_fields?: PromptFields
+      // Validate judge data at runtime
+      const validatedJudge = validateJudge(judge)
+      if (!validatedJudge) {
+        console.warn('Invalid judge data, skipping:', judge)
+        continue
       }
 
       // Check if this (question, judge) pair already has an evaluation
-      const pairKey = `${question.id}:${judgeData.id}`
+      const pairKey = `${question.id}:${validatedJudge.id}`
       if (existingPairs.has(pairKey)) {
         skippedCount++
         continue
@@ -134,14 +124,7 @@ export async function getEvaluationTasksWithSkipped(queueId: string): Promise<Ta
           reasoning: answer.reasoning,
           ...((answer.raw_value as Record<string, unknown>) || {}),
         },
-        judge: {
-          id: judgeData.id,
-          name: judgeData.name,
-          system_prompt: judgeData.system_prompt,
-          model_provider: judgeData.model_provider as 'openai' | 'anthropic',
-          model_name: judgeData.model_name,
-          prompt_fields: judgeData.prompt_fields,
-        },
+        judge: validatedJudge,
       })
     }
   }

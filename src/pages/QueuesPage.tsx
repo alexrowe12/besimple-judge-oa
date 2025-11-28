@@ -1,15 +1,9 @@
 import { useParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { supabase } from '@/lib/supabase'
+import { validateQueues } from '@/lib/validation'
 import { QueueList } from '@/components/queues/QueueList'
 import { QueueDetail } from '@/components/queues/QueueDetail'
-
-interface Queue {
-  id: string
-  name: string | null
-  created_at: string
-  submissions: { count: number }[]
-}
 
 export function QueuesPage() {
   const { queueId } = useParams()
@@ -27,7 +21,8 @@ export function QueuesPage() {
         .order('created_at', { ascending: false })
 
       if (error) throw error
-      return data as Queue[]
+      // Validate response data at runtime
+      return validateQueues(data)
     },
   })
 
